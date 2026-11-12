@@ -1,16 +1,9 @@
-<p align="center">
-  <a href="https://www.appvia.io/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/appvia-logo-white.png">
-      <img src="docs/assets/appvia-logo-dark-blue.png" alt="Appvia" width="320">
-    </picture>
-  </a>
-</p>
+<a href="https://www.appvia.io/"><img src="docs/assets/appvia-banner.png" alt="Appvia" width="100%"></a>
 
 <p align="center">
   <a href="https://www.appvia.io/"><img src="https://img.shields.io/static/v1?label=APPVIA&message=Security%20Tooling&labelColor=022859&color=1578E4&style=for-the-badge" alt="Appvia Security Tooling"></a>
   <a href="https://github.com/appvia/wfx-loot-scanner/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/appvia/wfx-loot-scanner/ci.yml?branch=main&label=CI&labelColor=022859&style=for-the-badge" alt="CI"></a>
-  <a href="https://github.com/appvia/wfx-loot-scanner/blob/main/LICENSE"><img src="https://img.shields.io/github/license/appvia/wfx-loot-scanner?labelColor=022859&color=1578E4&style=for-the-badge" alt="Licence"></a>
+  <a href="https://github.com/appvia/wfx-loot-scanner/blob/main/LICENSE"><img src="https://img.shields.io/github/license/appvia/wfx-loot-scanner?label=licence&labelColor=022859&color=1578E4&style=for-the-badge" alt="Licence"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-1578E4?labelColor=022859&logo=python&logoColor=white&style=for-the-badge" alt="Python 3.10+">
   <a href="https://appvia-community.slack.com/join/shared_invite/zt-1s7i7xy85-T155drryqU56emm09ojMVA#/shared-invite/email"><img src="https://img.shields.io/badge/Slack-Join%20Community-1578E4?labelColor=022859&logo=slack&style=for-the-badge" alt="Slack Community"></a>
 </p>
