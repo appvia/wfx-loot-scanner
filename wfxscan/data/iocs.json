@@ -1,0 +1,112 @@
+{
+  "campaign": "wfx-loot",
+  "ioc_set_version": "2026-11-12",
+  "attack_start": "2026-11-10T12:45:00Z",
+  "default_since": "2026-10-01",
+  "sources": {
+    "aikido": "https://www.aikido.dev/blog/compromised-github-accounts-push-ci-secret-stealer-to-tens-of-thousands-of-repositories",
+    "safedep": "https://safedep.io/blog/github-actions-wfx-credential-stealer",
+    "safedep_iocs_csv": "https://safedep.io/data/blogs/wfx-github-actions-iocs.csv",
+    "safedep_affected_csv": "https://safedep.io/data/blogs/wfx-github-actions-affected-repositories.csv"
+  },
+
+  "probe": {
+    "pr_titles": ["docs: dependency audit notes"],
+    "pr_bodies": ["Routine dependency audit notes."],
+    "head_branches": ["wfx-docs"],
+    "source": "aikido, safedep"
+  },
+
+  "branch_patterns": [
+    {"regex": "^wfx-docs$", "severity": "CRITICAL", "description": "probe pull request branch", "source": "aikido, safedep"},
+    {"regex": "^ci-check-[0-9]{4}$", "severity": "HIGH", "description": "campaign branch (also seen in the October GhostAction wave)", "source": "aikido"},
+    {"regex": "^chore/[a-z0-9]{8}$", "severity": "MEDIUM", "low_if_all_letters": true, "description": "short-lived throwaway branch (8 random characters)", "source": "aikido"}
+  ],
+
+  "commit_subjects": [
+    {"subject": "ci: refresh build cache", "severity_ci": "HIGH", "severity_other": "MEDIUM", "window_only": false, "description": "injects about 1,500 lines into an existing workflow", "source": "aikido, safedep"},
+    {"subject": "chore: add ci helper", "severity_ci": "CRITICAL", "severity_other": "MEDIUM", "window_only": false, "description": "adds .ci-xxxxxx.sh and an npm postinstall hook", "source": "aikido, safedep"},
+    {"subject": "chore: add dependency audit workflow", "severity_ci": "CRITICAL", "severity_other": "HIGH", "window_only": false, "description": "adds .github/workflows/build-audit-xxxxxx.yml", "source": "aikido, safedep"},
+    {"subject": "docs: dependency audit notes", "severity_ci": "HIGH", "severity_other": "HIGH", "window_only": false, "description": "probe commit", "source": "aikido, safedep"},
+    {"subject": "chore: initial commit", "severity_ci": "MEDIUM", "severity_other": null, "window_only": true, "description": "pushed to empty repositories before the new workflow file", "source": "safedep"},
+    {"subject": "ci: restore", "severity_ci": "MEDIUM", "severity_other": null, "window_only": true, "description": "clean-up commit that removes the payload", "source": "aikido, safedep"},
+    {"subject": "ci: cleanup", "severity_ci": "MEDIUM", "severity_other": null, "window_only": true, "description": "clean-up commit that removes the payload", "source": "aikido, safedep"}
+  ],
+
+  "compromised_authors": [
+    {"login": "wdio-bot", "severity": "MEDIUM", "description": "bot account whose token was used to push the payload", "source": "safedep"}
+  ],
+
+  "payload_paths": [
+    {"regex": "(^|/)\\.ci-[A-Za-z0-9]{6}\\.sh$", "severity": "CRITICAL", "description": "payload shell script used by the npm postinstall variant", "source": "aikido, safedep"},
+    {"regex": "^\\.github/workflows/build-audit-[A-Za-z0-9]{6}\\.ya?ml$", "severity": "CRITICAL", "description": "payload workflow used by the new-workflow variant", "source": "aikido, safedep"},
+    {"regex": "^docs/wfx-audit\\.md$", "severity": "HIGH", "description": "file added by the probe pull request", "source": "safedep"}
+  ],
+
+  "large_workflow_insertion_lines": 1000,
+
+  "content": [
+    {"id": "exfil-endpoint", "check": "WFX-06", "severity": "CRITICAL",
+     "regex": "194\\.150\\.166\\.244|18\\.143\\.168\\.96|153\\.75\\.82\\.159",
+     "description": "exfiltration server address", "source": "aikido, safedep"},
+    {"id": "campaign-token", "check": "WFX-06", "severity": "CRITICAL",
+     "regex": "b42d70a7aab9140ca19e8249|e6ny5telf3pht81qk5zv|15f44heehnax8jdf41yx",
+     "description": "WF_CTOKEN campaign token sent with stolen data", "source": "safedep"},
+    {"id": "telegram-attacker", "check": "WFX-06", "severity": "CRITICAL",
+     "regex": "1004340163187|(8708988906|9196217635|9180059428|8902935164|8876515636):AA",
+     "description": "attacker Telegram chat ID or bot ID", "source": "safedep"},
+    {"id": "telegram-generic", "check": "WFX-06", "severity": "MEDIUM",
+     "regex": "api\\.telegram\\.org",
+     "paths": [".github/workflows/", "package.json", ".sh"],
+     "description": "Telegram Bot API call in CI or install scripts (often legitimate notifications)", "source": "aikido, safedep"},
+    {"id": "payload-config", "check": "WFX-07", "severity": "HIGH",
+     "regex": "WF_(CALLBACK|CTOKEN|TG_BOTS|TG_CHAT|MEMSCAN|EXFIL_[A-Z]+|PRIVATE|FALLBACK|MAXFILES|TARBALL)",
+     "description": "payload configuration variable", "source": "safedep"},
+    {"id": "payload-marker", "check": "WFX-07", "severity": "CRITICAL",
+     "regex": "wfx-loot|WFX-BEGIN|wfx-ci-|\\.wfx-|/tmp/wfx-scan-|RUNNER_TEMP/wfx-",
+     "description": "payload marker string (artefact, step summary, staging path or Azure credential name)", "source": "aikido, safedep"},
+    {"id": "payload-workflow-shape", "check": "WFX-07", "severity": "HIGH",
+     "regex": "Dependency Audit [a-z0-9]{4}|name: Pass runtime",
+     "paths": [".github/workflows/"],
+     "description": "workflow or step name used by the payload", "source": "safedep"},
+    {"id": "postinstall-hook", "check": "WFX-08", "severity": "CRITICAL",
+     "regex": "\\.ci-[A-Za-z0-9]{6}\\.sh",
+     "description": "reference to the .ci-xxxxxx.sh payload script (postinstall hook)", "source": "aikido, safedep"},
+    {"id": "ghostaction-endpoint", "check": "WFX-18", "severity": "CRITICAL",
+     "regex": "193\\.32\\.204\\.199|#ghc2",
+     "description": "October GhostAction exfiltration server or cron tag", "source": "aikido"},
+    {"id": "ghostaction-vscode-task", "check": "WFX-18", "severity": "MEDIUM",
+     "regex": "\"runOn\": *\"folderOpen\"",
+     "paths": [".vscode/tasks.json"],
+     "description": "VS Code task that runs when the folder is opened (GhostAction developer-machine stealer)", "source": "aikido"}
+  ],
+
+  "sha256": [
+    {"hash": "89695abb392d5cfd4972672961e644bb46baa98aa1ed7173c2a2816c762735cf", "description": "stealer script", "source": "aikido"},
+    {"hash": "6960931e69bbcd70f9d0727c536251fa94167d0b8a988d12c5efe45e54b1d389", "description": ".ci-e5infq.sh payload (neuronai-studio v3.14.3)", "source": "safedep"},
+    {"hash": "a45d3ced951d2deaaa76e39c8d20c78cfcb0092b9b6bde2fb8347c98caad2d54", "description": "beta.yml with payload (redock v1.0.278)", "source": "safedep"},
+    {"hash": "73cec6bc7d2306dcf7087c445bc2f57029a1b74ae24b076605e66b1123a7ddee", "description": "beta.yml with payload (redock v1.0.280)", "source": "safedep"},
+    {"hash": "7128295ffbb8470d62932294e859c1208619a9ef34fe92609b4fcd478bbbcb59", "description": "beta.yml with payload, Telegram variant (redock v1.0.282)", "source": "safedep"}
+  ],
+
+  "commits": [
+    {"sha": "9fa761d4a077278eda2d931ba0e997a62b7576ce", "description": "attacker commit tagged as redock v1.0.278", "source": "safedep"},
+    {"sha": "ff0dce78e1397c0caa888b182760d8b39efec8ba", "description": "attacker commit tagged as redock v1.0.280", "source": "safedep"},
+    {"sha": "64f0bc40ca8619555934fd83cbee9b9c47922c9c", "description": "attacker commit tagged as redock v1.0.282", "source": "safedep"}
+  ],
+
+  "packages": [
+    {"ecosystem": "packagist", "name": "digitalelvis/neuronai-studio", "versions": ["3.14.3", "v3.14.3"], "source": "aikido, safedep"},
+    {"ecosystem": "go", "name": "github.com/vkuznet/gocurl", "versions": ["v0.0.0-20261111095532-8d5aad0cb0da"], "source": "safedep"},
+    {"ecosystem": "go", "name": "github.com/onuragtas/redock", "versions": ["v1.0.278", "v1.0.280", "v1.0.282"], "source": "safedep"},
+    {"ecosystem": "go", "name": "github.com/onuragtas/docker-env", "versions": ["v1.0.278", "v1.0.280", "v1.0.282"], "source": "aikido, safedep"}
+  ],
+
+  "actions": {
+    "cache_key_prefix": "wfx-",
+    "artifact_name_prefix": "wfx-loot",
+    "source": "aikido"
+  },
+
+  "ghostaction_font_path": "public/fonts/fa-solid-400.woff2"
+}

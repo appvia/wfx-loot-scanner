@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wfx-loot-scanner"
+dynamic = ["version"]
+description = "Scan GitHub organisations and repositories for indicators of the wfx-loot CI secret-stealer campaign"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Appvia" }]
+keywords = ["github", "github-actions", "supply-chain", "incident-response", "ioc", "wfx-loot"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/appvia/wfx-loot-scanner"
+Issues = "https://github.com/appvia/wfx-loot-scanner/issues"
+Appvia = "https://www.appvia.io/"
+
+[project.scripts]
+wfx-scan = "wfxscan.cli:main"
+
+[tool.setuptools]
+packages = ["wfxscan"]
+
+[tool.setuptools.package-data]
+wfxscan = ["data/*.json"]
+
+[tool.setuptools.dynamic]
+version = { attr = "wfxscan.__version__" }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+# Check descriptions and report text are long strings by design.
+ignore = ["E501"]

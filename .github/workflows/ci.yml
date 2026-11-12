@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install linters
+        run: python -m pip install ruff==0.17.4 zizmor==1.32.0
+      - name: ruff
+        run: ruff check --output-format github .
+      - name: Python 3.10 syntax
+        run: |
+          python - <<'EOF'
+          import ast, pathlib
+          for p in [*pathlib.Path(".").rglob("*.py"), pathlib.Path("wfx-scan")]:
+              ast.parse(p.read_text(), filename=str(p), feature_version=(3, 10))
+          EOF
+      - name: Validate iocs.json
+        run: python -m json.tool wfxscan/data/iocs.json > /dev/null
+      - name: zizmor (workflow security)
+        run: zizmor --offline --format github .github/workflows
+
+  test:
+    name: test (py${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and end-to-end tests
+        run: python -m unittest -v
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install and run the console script
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install .
+          /tmp/venv/bin/wfx-scan --version
+          /tmp/venv/bin/python -c "from wfxscan.iocs import IOCs; print(IOCs().version)"
