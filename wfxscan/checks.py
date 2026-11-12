@@ -17,7 +17,7 @@ CHECKS = [
     ("WFX-02", "Campaign branch names", "Branches named wfx-docs, ci-check-NNNN or chore/xxxxxxxx (8 lower-case alphanumerics).", "history"),
     ("WFX-03", "Campaign commit messages", "Commit subjects used by the attacker (ci: refresh build cache, chore: add ci helper, chore: add dependency audit workflow, docs: dependency audit notes) and, within the attack window, the clean-up subjects (ci: restore, ci: cleanup, chore: initial commit) when they touch CI files. Also commits by known compromised bot accounts.", "history"),
     ("WFX-04", "Payload files in history", "Files added at any point in the window: .ci-xxxxxx.sh, .github/workflows/build-audit-xxxxxx.yml, docs/wfx-audit.md.", "history"),
-    ("WFX-05", "Large workflow insertion", "A single commit adding 1,000 or more lines to a workflow file (the payload is about 1,500 lines).", "history"),
+    ("WFX-05", "Large workflow insertion", "A single commit adding 1,000 or more lines to a workflow file (the payload is about 1,500 lines). HIGH with campaign indicators in the same commit, MEDIUM for an existing workflow in the attack window, LOW otherwise (new or generated files).", "history"),
     ("WFX-06", "Exfiltration endpoints and tokens", "Exfiltration IP addresses, WF_CTOKEN campaign tokens, attacker Telegram chat and bot IDs, and Telegram API calls in CI files. Added or removed lines both count, so reverted payloads are still found.", "history"),
     ("WFX-07", "Payload markers", "Payload configuration variables (WF_CALLBACK, WF_TG_BOTS, WF_EXFIL_* etc.), marker strings (wfx-loot, WFX-BEGIN, wfx-ci-, .wfx-) and payload workflow or step names.", "history"),
     ("WFX-08", "npm postinstall hook", "References to the .ci-xxxxxx.sh payload script, as used by the postinstall hook in package.json.", "history"),
@@ -225,14 +225,24 @@ class RepoScan:
         cr.summary = f"{n} file changes inspected"
 
     def c_wfx_05(self, cr):
+        """The payload adds ~1,500 lines to an existing workflow. Size alone is weak evidence (generated
+        workflows such as gh-aw lock files are often larger), so severity depends on corroboration."""
         lim, n = self.iocs.big_workflow_lines, 0
+        corroborated = {h.sha for h in self._content() if SEV_ORDER[h.ioc.severity] >= 3}
         for c in self.src.commits():
             for f in c.files:
-                if WORKFLOW_RE.match(f.path):
-                    n += 1
-                    if f.additions >= lim:
-                        hot = c.date >= self.iocs.attack_start or c.subject.strip().lower() in self.iocs.subjects
-                        self._flag(cr, "HIGH" if hot else "MEDIUM", f"+{f.additions} lines to '{f.path}' in one commit", c)
+                if not WORKFLOW_RE.match(f.path):
+                    continue
+                n += 1
+                if f.additions < lim:
+                    continue
+                detail = f"+{f.additions} lines to '{f.path}' in one commit"
+                if c.subject.strip().lower() in self.iocs.subjects or c.sha in corroborated:
+                    self._flag(cr, "HIGH", detail + " with campaign indicators", c)
+                elif c.date >= self.iocs.attack_start and self.src.existed_before(c, f):
+                    self._flag(cr, "MEDIUM", detail + " (existing workflow, attack window)", c)
+                else:
+                    self._flag(cr, "LOW", detail + " (new file or before the attack window)", c)
         cr.summary = f"{n} workflow file changes inspected (threshold {lim} lines)"
 
     def _content(self):
@@ -306,15 +316,17 @@ class RepoScan:
         return short[0] + (f" and {len(short) - 1} other branch(es)" if len(short) > 1 else "")
 
     def c_wfx_11(self, cr):
-        cap = 300
+        cap = self.src.read_cap  # None: no limit (local reads are cheap)
         blobs = self._tip_blobs(lambda p: p.rsplit("/", 1)[-1] in MANIFEST_NAMES)
-        if len(blobs) > cap:
+        if cap and len(blobs) > cap:
             self._limit(cr, f"{cap} of {len(blobs)} unique manifest files read")
-        for sha, (path, refs) in list(blobs.items())[:cap]:
-            data = self.src.read_blob(sha)
+        chosen = list(blobs.items())[:cap]
+        contents = self.src.read_blobs([sha for sha, _ in chosen])
+        for sha, (path, refs) in chosen:
+            data = contents.get(sha)
             for hit in self.iocs.package_hits(path, (data or b"").decode("utf-8", "replace")):
                 cr.add("HIGH", f"{path} pins affected version {hit}", self._where(refs))
-        cr.summary = f"{min(len(blobs), cap)} unique manifest file(s) read across {len(self.src.tips())} branch tip(s)"
+        cr.summary = f"{len(chosen)} unique manifest file(s) read across {len(self.src.tips())} branch tip(s)"
 
     def c_wfx_12(self, cr):
         tips = self.src.tips()
@@ -327,19 +339,21 @@ class RepoScan:
         for path, refs in present.items():
             sev, desc = self.iocs.payload_path_match(path)
             cr.add(sev, f"'{path}' present: {desc}", self._where(refs))
-        cap = 200
+        cap = self.src.read_cap
         blobs = self._tip_blobs(lambda p: p.rsplit("/", 1)[-1] == "package.json" and "node_modules/" not in p)
-        if len(blobs) > cap:
+        if cap and len(blobs) > cap:
             self._limit(cr, f"{cap} of {len(blobs)} unique package.json files parsed")
-        for sha, (path, refs) in list(blobs.items())[:cap]:
+        chosen = list(blobs.items())[:cap]
+        contents = self.src.read_blobs([sha for sha, _ in chosen])
+        for sha, (path, refs) in chosen:
             try:
-                scripts = json.loads(self.src.read_blob(sha) or b"{}").get("scripts") or {}
+                scripts = json.loads(contents.get(sha) or b"{}").get("scripts") or {}
             except (ValueError, AttributeError):
                 continue
             for k in ("preinstall", "install", "postinstall", "prepare"):
                 if hook.rx.search(str(scripts.get(k, ""))):
                     cr.add("CRITICAL", f"{path} '{k}' script runs the payload script", self._where(refs))
-        cr.summary = f"{len(tips)} branch tip(s) inspected, {min(len(blobs), cap)} unique package.json file(s) parsed"
+        cr.summary = f"{len(tips)} branch tip(s) inspected, {len(chosen)} unique package.json file(s) parsed"
 
     def c_wfx_13(self, cr):
         r = self.gh.get(f"repos/{self.slug}/actions/caches", {"key": self.iocs.cache_prefix, "per_page": 100})

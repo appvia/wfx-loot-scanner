@@ -81,6 +81,7 @@ def _markdown(results: list[RepoResult], meta: dict) -> str:
           f"| Targets | {_md_escape(', '.join(meta['targets']))} |",
           f"| History window | commits since {meta['since']} (attack began {meta['attack_start']}) |",
           f"| Repositories scanned | {len(results)}" + (f" ({meta['skipped']} skipped: {meta['skipped_reason']})" if meta.get("skipped") else "") + " |",
+          f"| Excluded by --exclude | {_md_escape(', '.join(meta.get('excluded') or [])) or 'none'} |",
           f"| GitHub API calls | {meta.get('api_calls', 0)} |", ""]
 
     L += ["## Summary", "", "| Status | Repositories | Meaning |", "|---|---|---|"]
