@@ -15,7 +15,7 @@ Checks GitHub organisations and repositories for signs of the **wfx-loot** campa
 It runs 18 checks per repository and writes a Markdown, JSON and CSV report showing the result of every check, not just the hits.
 
 - No third-party dependencies: Python 3.10+ and git.
-- Read-only. It never writes to GitHub and never executes repository content.
+- Read-only. It never writes to GitHub, and repository content is only read and pattern-matched, never run.
 - Works through the GitHub API alone, or from mirror clones for larger estates.
 
 ## The incident
@@ -102,7 +102,7 @@ What each permission is used for:
 | Pull requests | probe pull requests and their commits (WFX-01, WFX-02) |
 | Actions | caches, artefacts and workflow runs (WFX-13 to WFX-16) |
 
-If a permission is missing, the affected checks are marked SKIP or ERROR in the report rather than silently passing.
+If a permission is missing, the affected checks are marked ERROR and the repository is reported as INCOMPLETE, never CLEAN. An organisation or repository that cannot be read at all also appears as INCOMPLETE.
 
 ## Usage
 
@@ -175,7 +175,7 @@ Repository status:
 | LIKELY COMPROMISED | at least one critical indicator |
 | SUSPICIOUS | at least one high-severity indicator |
 | REVIEW | medium-severity indicators only; often benign |
-| INCOMPLETE | nothing found, but at least one check could not run |
+| INCOMPLETE | nothing found, but coverage was partial: a check could not run (for example missing permission or SSO), a coverage limit was reached, or the organisation or repository could not be read |
 | CLEAN | every check that could run found nothing |
 
 Check result: PASS (nothing found), WARN (medium findings), FAIL (high or critical findings), SKIP (not applicable or no access), ERROR (the check failed to run). Low-confidence findings are listed but do not change a result.
@@ -187,7 +187,7 @@ Reports contain repository names, commit details and account names. Treat them a
 | Code | Meaning |
 |---|---|
 | 0 | all repositories CLEAN |
-| 1 | at least one REVIEW or INCOMPLETE, none worse |
+| 1 | at least one REVIEW or INCOMPLETE, none worse, or nothing was scanned |
 | 2 | at least one SUSPICIOUS or LIKELY COMPROMISED |
 | 64 | usage error |
 
@@ -211,13 +211,22 @@ Reports contain repository names, commit details and account names. Treat them a
 - Run-number gaps (WFX-15) also appear when people delete runs. Use them to support other findings, not on their own.
 - The scanner looks at repositories only. It does not read the organisation audit log or cloud logs; do that separately (see above).
 - SafeDep's list covers default branches of public repositories only.
+- Anyone who can open a pull request can trigger findings: a PR with the probe title, or IOC strings pushed in a fork PR, are reported because the scanner reads pull request commits. Check who authored a finding before acting on it.
 
 ## How the scanner protects itself
 
-- Repository content is only read and pattern-matched, never run.
-- git runs with global and system config ignored (so `insteadOf` rewrites, credential helpers and diff drivers do not apply), hooks and fsmonitor disabled.
-- Clone mode uses bare mirrors, so nothing is checked out.
-- The token is passed to git through the environment, not the command line.
+Everything read from a scanned repository (names, messages, paths, file contents, API responses) is treated as untrusted.
+
+- **No repository code runs.** git is invoked with `--no-textconv` and `--no-ext-diff`, and with signature display, hooks and fsmonitor disabled on the command line, so a repository's own config and attributes cannot start a program. A regression test plants a malicious diff driver and checks it never runs.
+- **No user or system git config.** Global and system config are ignored, so `insteadOf` rewrites and credential helpers do not apply.
+- **`--path` is used exactly as given.** The scanner uses that directory's own git directory and refuses to fall back to a parent repository. git's ownership check (`safe.directory`) is left on.
+- **Clone mode uses bare mirrors,** so nothing is checked out.
+- **The token stays with GitHub.** It is sent only to the configured API host over HTTPS, is dropped if a redirect points elsewhere, and is never passed to git child processes. For clone mode it reaches git through the environment, not the command line.
+- **Output is parsed safely.** git output is read NUL-separated, so file names and commit messages cannot break parsing.
+- **Reports are inert.** Untrusted text is escaped in Markdown and HTML, and CSV cells that could be read as spreadsheet formulas are prefixed with `'`. Reports and clones are created readable by your user only.
+- **Size and coverage limits.** Files over 20 MB are not read. When a limit is reached, the repository is reported as INCOMPLETE, not CLEAN.
+
+If you scan a copy of a repository someone else gave you, prefer `--mode clone` against GitHub, or a fresh `git clone --mirror`. Then the git config is one git created rather than one supplied with the copy.
 
 ## Development
 
@@ -225,7 +234,7 @@ Reports contain repository names, commit details and account names. Treat them a
 python3 -m unittest -v
 ```
 
-The tests build throwaway repositories containing inert copies of the indicators and run every check against them, along with a clean control repository and a fake GitHub API for API mode. CI runs them on Python 3.10 and 3.13.
+The tests build throwaway repositories containing inert copies of the indicators and run every check against them, along with a clean control repository and a fake GitHub API for API mode. CI runs them on Python 3.10, 3.12 and 3.14, on Linux and macOS. `tests/test_security.py` covers the threat model above with hostile repositories, names and API responses.
 
 Layout:
 

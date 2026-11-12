@@ -29,6 +29,8 @@ Sources: **A** is Aikido, **S** is SafeDep. Full links are in the [README](../RE
 
 **Needs:** API (Pull requests: read).
 
+**False positives:** on a public repository anyone can open a pull request with this title or body. Confirm the author is someone with write access before treating the account as compromised.
+
 ## WFX-02 Campaign branch names
 
 **Looks for:** branches, and head branches of pull requests whose branch has since been deleted, matching:

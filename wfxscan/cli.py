@@ -7,17 +7,19 @@ import concurrent.futures as cf
 import csv
 import datetime as dt
 import io
+import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from . import __version__
-from .checks import RepoScan, recent_pulls
+from .checks import RepoResult, RepoScan, recent_pulls
 from .github import GitHub, GitHubError, api_url_for, find_token
 from .iocs import IOCs
 from .report import STATUS_ORDER, write_reports
-from .sources import ApiSource, GitSource, git
+from .sources import ApiSource, GitSource, git, resolve_git_dir
 
 EXIT_CLEAN, EXIT_REVIEW, EXIT_FLAGGED, EXIT_USAGE = 0, 1, 2, 64
 
@@ -73,11 +75,17 @@ def load_affected(url: str) -> dict | None:
 
 
 def origin_slug(path: Path, github_url: str) -> str | None:
-    rc, out, _ = git(path, "remote", "get-url", "origin")
+    """owner/name if origin points at the GitHub host itself, else None (API checks are then skipped)."""
+    try:
+        git_dir = resolve_git_dir(path)
+    except RuntimeError:
+        return None
+    rc, out, _ = git(path, "config", "--get", "remote.origin.url", git_dir=git_dir)
     if rc != 0:
         return None
-    host = re.sub(r"^https?://", "", github_url).rstrip("/")
-    m = re.search(rf"(?:{re.escape(host)}|github\.com)[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$", out.strip())
+    h = re.escape(urllib.parse.urlparse(github_url).netloc)
+    m = re.fullmatch(rf"(?:https://{h}/|ssh://git@{h}/|git@{h}:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+                     out.strip())
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
@@ -100,6 +108,11 @@ def mirror_sync(workdir: Path, slug: str, token: str, github_url: str) -> Path:
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
+    os.umask(0o077)  # reports and mirror clones hold sensitive data; keep them private to this user
+    try:
+        api_url = api_url_for(a.github_url)
+    except ValueError as e:
+        build_parser().error(str(e))
     if not (a.org or a.repo or a.path):
         build_parser().error("give at least one --org, --repo or --path")
     if a.offline and (a.org or a.repo):
@@ -115,7 +128,7 @@ def main(argv=None):
     if not a.offline:
         token = find_token(a.gh_user)
         if token:
-            gh = GitHub(token, api_url_for(a.github_url), log=log)
+            gh = GitHub(token, api_url, log=log)
         elif a.org or a.repo:
             build_parser().error("no GitHub token: set GH_TOKEN, or log in with `gh auth login`")
         else:
@@ -125,11 +138,13 @@ def main(argv=None):
     # ------------------------------------------------------------ targets
     targets: list[tuple[str, dict | None, Path | None]] = []  # (name, repo metadata, local path)
     skipped = 0
+    unreachable: list[RepoResult] = []
     for owner in a.org:
         try:
             repos = gh.owner_repos(owner)
         except GitHubError as e:
             log(f"error: cannot list repositories for {owner}: {e}")
+            unreachable.append(RepoResult(f"{owner} (organisation)", error=f"could not list repositories: {e}"))
             continue
         kept = [r for r in repos if a.include_archived or not r.get("archived")]
         skipped += len(repos) - len(kept)
@@ -140,6 +155,7 @@ def main(argv=None):
             targets.append((slug, gh.get(f"repos/{slug}"), None))
         except GitHubError as e:
             log(f"error: {slug}: {e}")
+            unreachable.append(RepoResult(slug, error=f"could not read repository: {e}"))
     for p in a.path:
         p = Path(p).expanduser().resolve()
         targets.append((origin_slug(p, a.github_url) or p.name, None, p))
@@ -189,6 +205,11 @@ def main(argv=None):
                 f"(pass {c['PASS']}, warn {c['WARN']}, fail {c['FAIL']}, skip {c['SKIP']}, error {c['ERROR']})"
                 + (f" {res.error[:100]}" if res.error else ""))
             results.append(res)
+    for r in unreachable:
+        r.finish()
+        results.append(r)
+    if not results:
+        log("warning: no repositories were scanned")
 
     meta = {
         "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -210,4 +231,4 @@ def main(argv=None):
     print(f"\nReport: {paths['md']}\nJSON:   {paths['json']}\nCSV:    {paths['csv']}")
     if counts["LIKELY COMPROMISED"] or counts["SUSPICIOUS"]:
         sys.exit(EXIT_FLAGGED)
-    sys.exit(EXIT_REVIEW if counts["REVIEW"] or counts["INCOMPLETE"] else EXIT_CLEAN)
+    sys.exit(EXIT_REVIEW if counts["REVIEW"] or counts["INCOMPLETE"] or not results else EXIT_CLEAN)

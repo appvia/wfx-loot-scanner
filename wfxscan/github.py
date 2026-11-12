@@ -38,20 +38,41 @@ def find_token(gh_user: str | None = None) -> str | None:
 
 
 def api_url_for(github_url: str) -> str:
-    host = urllib.parse.urlparse(github_url).netloc
+    u = urllib.parse.urlparse(github_url)
+    if u.scheme != "https" or not u.netloc:
+        raise ValueError("--github-url must be an https:// URL")
+    host = u.netloc
     return "https://api.github.com" if host in ("github.com", "www.github.com") else f"{github_url.rstrip('/')}/api/v3"
+
+
+class SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but never send the token to a different host or over plain HTTP."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            old, nxt = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
+            if nxt.scheme != "https" or nxt.netloc.lower() != old.netloc.lower():
+                for h in ("Authorization", "authorization"):
+                    new.headers.pop(h, None)
+                    new.unredirected_hdrs.pop(h, None)
+        return new
 
 
 class GitHub:
     def __init__(self, token: str, api_url: str = "https://api.github.com", log=None):
         self.token = token
         self.api_url = api_url.rstrip("/")
+        self._host = urllib.parse.urlparse(self.api_url).netloc.lower()
+        self._opener = urllib.request.build_opener(SameHostRedirectHandler)
         self.calls = 0
         self._lock = threading.Lock()
         self.log = log or (lambda m: print(m, file=sys.stderr, flush=True))
 
     # ------------------------------------------------------------------ core
-    def _request(self, url: str, accept: str = "application/vnd.github+json"):
+    def _request(self, url: str, accept: str = "application/vnd.github+json", max_bytes: int | None = None):
+        if not self._same_host(url):
+            raise GitHubError(0, "refusing to send the token to another host", url)
         req = urllib.request.Request(url, headers={
             "Authorization": f"Bearer {self.token}",
             "Accept": accept,
@@ -62,8 +83,8 @@ class GitHub:
             with self._lock:
                 self.calls += 1
             try:
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    return r.status, dict(r.headers), r.read()
+                with self._opener.open(req, timeout=60) as r:
+                    return r.status, dict(r.headers), r.read(max_bytes + 1 if max_bytes else -1)
             except urllib.error.HTTPError as e:
                 body = e.read()
                 headers = dict(e.headers or {})
@@ -96,8 +117,16 @@ class GitHub:
             return 60
         return None
 
+    def _same_host(self, url: str) -> bool:
+        u = urllib.parse.urlparse(url)
+        return u.scheme == "https" and u.netloc.lower() == self._host
+
+    def _safe_next(self, link_header: str) -> str | None:
+        nxt = _next_link(link_header)
+        return nxt if nxt and self._same_host(nxt) else None
+
     def _url(self, path: str, params: dict | None = None) -> str:
-        url = path if path.startswith("http") else f"{self.api_url}/{path.lstrip('/')}"
+        url = f"{self.api_url}/{path.lstrip('/')}"
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
         return url
@@ -111,10 +140,13 @@ class GitHub:
             raise GitHubError(status, _message(body), path)
         return json.loads(body) if body else None
 
-    def get_raw(self, path: str) -> bytes:
-        status, _, body = self._request(self._url(path), accept="application/vnd.github.raw+json")
+    def get_raw(self, path: str, max_bytes: int | None = None) -> bytes | None:
+        """Raw file content, or None if it is larger than max_bytes."""
+        status, _, body = self._request(self._url(path), accept="application/vnd.github.raw+json", max_bytes=max_bytes)
         if status >= 400:
             raise GitHubError(status, _message(body), path)
+        if max_bytes and len(body) > max_bytes:
+            return None
         return body
 
     def paginate(self, path: str, params: dict | None = None, key: str | None = None,
@@ -138,7 +170,7 @@ class GitHub:
             pages += 1
             if max_pages and pages >= max_pages:
                 return
-            url = _next_link({k.lower(): v for k, v in headers.items()}.get("link", ""))
+            url = self._safe_next({k.lower(): v for k, v in headers.items()}.get("link", ""))
 
     # ------------------------------------------------------------------ helpers
     def owner_repos(self, owner: str) -> list[dict]:
