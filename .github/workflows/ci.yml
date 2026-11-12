@@ -59,7 +59,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Unit and end-to-end tests
-        run: python -m unittest -v
+        shell: bash # runs with -eo pipefail
+        run: |
+          # Development mode shows ResourceWarning and DeprecationWarning; any warning fails the job.
+          python -X dev -m unittest -v 2>&1 | tee "$RUNNER_TEMP/test.log"
+          if grep -nE "Warning:|Exception ignored|Traceback" "$RUNNER_TEMP/test.log"; then
+            echo "::error::warnings or tracebacks in test output (see lines above)"
+            exit 1
+          fi
 
   package:
     name: package

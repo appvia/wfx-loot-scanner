@@ -48,7 +48,8 @@ class TestCommand(unittest.TestCase):
         self.assertIn("## Checks performed", text)
         data = json.loads(js.read_text())
         self.assertEqual(len(data["repositories"][0]["checks"]), len(CHECKS))
-        rows = list(csv.DictReader(cs.open()))
+        with cs.open() as fh:
+            rows = list(csv.DictReader(fh))
         self.assertEqual({r["check_id"] for r in rows}, {c[0] for c in CHECKS})
 
     def test_usage_errors(self):

@@ -12,6 +12,7 @@ import os
 import re
 import urllib.parse
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,16 +48,23 @@ def git(repo, *args, timeout=3600, binary=False, env_extra=None, git_dir=None):
 
 
 def git_stream(git_dir, *args):
-    """Run git and yield stdout lines as bytes, without holding the whole output in memory."""
-    p = subprocess.Popen(["git", *GIT_SAFE, f"--git-dir={git_dir}", *args], env=child_env(), cwd=str(git_dir),
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        yield from p.stdout
-    finally:
-        p.stdout.close()
-        err = p.stderr.read().decode("utf-8", "replace")
-        if p.wait() != 0 and err.strip():
-            raise RuntimeError(f"git {args[0]} failed: {err.strip()[-200:]}")
+    """Run git and yield stdout lines as bytes, without holding the whole output in memory.
+
+    stderr goes to a temporary file rather than a pipe: an unread pipe can fill and hang git.
+    """
+    with tempfile.TemporaryFile() as err, subprocess.Popen(
+            ["git", *GIT_SAFE, f"--git-dir={git_dir}", *args], env=child_env(), cwd=str(git_dir),
+            stdout=subprocess.PIPE, stderr=err) as p:
+        try:
+            yield from p.stdout
+        finally:
+            p.stdout.close()
+            rc = p.wait()
+        if rc != 0:
+            err.seek(0)
+            msg = err.read().decode("utf-8", "replace").strip()
+            if msg:
+                raise RuntimeError(f"git {args[0]} failed: {msg[-200:]}")
 
 
 _ESC = {b"n": b"\n", b"t": b"\t", b'"': b'"', b"\\": b"\\", b"a": b"\a", b"b": b"\b",
