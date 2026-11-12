@@ -159,8 +159,9 @@ class TestTokenStaysOnGitHub(unittest.TestCase):
         self.assertEqual(gh._safe_next('<https://api.github.com/p?page=2>; rel="next"'), "https://api.github.com/p?page=2")
 
     def test_plain_http_github_url_refused(self):
-        with self.assertRaises(SystemExit) as e:
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stderr(io.StringIO()) as err:
             cli.main(["--org", "x", "--github-url", "http://ghes.example"])
+        self.assertIn("must be an https:// URL", err.getvalue())
         self.assertEqual(e.exception.code, cli.EXIT_USAGE)
 
 

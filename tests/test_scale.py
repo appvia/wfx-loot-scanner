@@ -138,3 +138,18 @@ class TestLimitsAndSpeed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNoLeakedResources(unittest.TestCase):
+    def test_scanning_leaves_no_open_pipes_or_files(self):
+        import gc
+        import warnings
+        with tempfile.TemporaryDirectory() as d:
+            iocs = IOCs()
+            repo = many_branch_repo(Path(d), 2)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                RepoScan("r", GitSource(repo, SINCE, iocs), iocs, None, None, SINCE_ISO, None, None).run()
+                gc.collect()
+            leaks = [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)]
+            self.assertEqual(leaks, [])
