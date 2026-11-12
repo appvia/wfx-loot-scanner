@@ -234,7 +234,7 @@ If you scan a copy of a repository someone else gave you, prefer `--mode clone` 
 python3 -m unittest -v
 ```
 
-The tests build throwaway repositories containing inert copies of the indicators and run every check against them, along with a clean control repository and a fake GitHub API for API mode. CI runs them on Python 3.10, 3.12 and 3.14, on Linux and macOS. `tests/test_security.py` covers the threat model above with hostile repositories, names and API responses.
+The tests build throwaway repositories containing inert copies of the indicators and run every check against them, along with a clean control repository and a fake GitHub API for API mode. CI runs them on Python 3.10, 3.12 and 3.14, on Linux and macOS. CI tools (ruff, zizmor, setuptools) are installed from hash-pinned files in `.github/requirements/`, and actions are pinned to commit SHAs. `tests/test_security.py` covers the threat model above with hostile repositories, names and API responses.
 
 Layout:
 

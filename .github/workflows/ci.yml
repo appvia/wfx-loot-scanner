@@ -25,8 +25,9 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
-      - name: Install linters
-        run: python -m pip install ruff==0.17.4 zizmor==1.32.0
+      - name: Install linters (hash-pinned)
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r .github/requirements/lint.txt
       - name: ruff
         run: ruff check --output-format github .
       - name: Python 3.10 syntax
@@ -74,6 +75,7 @@ jobs:
       - name: Install and run the console script
         run: |
           python -m venv /tmp/venv
-          /tmp/venv/bin/pip install .
+          /tmp/venv/bin/pip install --require-hashes --only-binary :all: -r .github/requirements/build.txt
+          /tmp/venv/bin/pip install --no-build-isolation --no-deps .
           /tmp/venv/bin/wfx-scan --version
           /tmp/venv/bin/python -c "from wfxscan.iocs import IOCs; print(IOCs().version)"
