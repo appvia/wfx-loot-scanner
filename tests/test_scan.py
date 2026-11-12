@@ -150,7 +150,7 @@ class FakeGitHub:
             return None
         raise GitHubError(404, "Not Found", path)
 
-    def get_raw(self, path):
+    def get_raw(self, path, max_bytes=None):
         return b"name: CI\n"
 
 

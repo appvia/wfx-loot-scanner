@@ -140,6 +140,7 @@ Options:
 | `--gh-user LOGIN` | | Use this `gh` account's token |
 | `--max-branches N` | 100 | API mode: branches whose history is read |
 | `--max-commits N` | 3000 | API mode: commits inspected per repository |
+| `--max-tips N` | 50 | Clone and path modes: branch tips checked for current files (WFX-11, WFX-12, WFX-18) |
 | `--no-dataset` | off | Do not download SafeDep's affected-repositories list (WFX-17 is skipped) |
 | `--offline` | off | No network access; only valid with `--path` |
 
@@ -156,9 +157,15 @@ Cloning is not required. Both modes run the same checks and should agree.
 | Branch tip checks (WFX-11, WFX-12) | default branch only | up to 50 branches |
 | Very large commits | first 300 files per commit | complete |
 
-Use API mode for a quick look or a small estate. Use clone mode for hundreds of repositories, a long `--since` window, or when you need every branch checked. As a guide, 40 repositories with about 780 commits in the window took 3 minutes and 1,574 API calls in API mode, and 27 seconds and 163 API calls in clone mode.
+Use API mode for a quick look or a small estate. Use clone mode for hundreds of repositories, a long `--since` window, or when you need every branch checked. API mode makes roughly ten times as many API calls as clone mode and takes several times longer, because it fetches every commit in the window separately.
 
-The REST API allows 5,000 requests an hour for a user token. The scanner waits and retries when it hits a rate limit.
+The REST API allows 5,000 requests an hour for a user token. The scanner waits and retries when it hits a rate limit. Dropped connections and truncated responses are retried too. If a repository still fails, it is reported as INCOMPLETE with the reason and the run carries on.
+
+### Large organisations
+
+- Use `--mode clone --jobs 8`. The first run downloads full history for every repository, which can take a while and needs disk space roughly equal to the size of all the repositories. Later runs reuse `--workdir` and only fetch what changed.
+- The progress line gives the reason for anything other than CLEAN, for example `INCOMPLETE ... - branch tip checks limited to 50 of N branches`. Raise the relevant limit (`--max-tips`, `--max-branches`, `--max-commits`) and scan that repository again with `--repo`.
+- Once mirrors exist, most repositories scan in a second or two. Repositories with thousands of branches or commits in the window take longer, mainly to generate their diffs.
 
 ## Output
 

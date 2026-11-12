@@ -46,6 +46,44 @@ def git(repo, *args, timeout=3600, binary=False, env_extra=None, git_dir=None):
     return p.returncode, out, p.stderr.decode("utf-8", "replace")
 
 
+def git_stream(git_dir, *args):
+    """Run git and yield stdout lines as bytes, without holding the whole output in memory."""
+    p = subprocess.Popen(["git", *GIT_SAFE, f"--git-dir={git_dir}", *args], env=child_env(), cwd=str(git_dir),
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        yield from p.stdout
+    finally:
+        p.stdout.close()
+        err = p.stderr.read().decode("utf-8", "replace")
+        if p.wait() != 0 and err.strip():
+            raise RuntimeError(f"git {args[0]} failed: {err.strip()[-200:]}")
+
+
+_ESC = {b"n": b"\n", b"t": b"\t", b'"': b'"', b"\\": b"\\", b"a": b"\a", b"b": b"\b",
+        b"f": b"\f", b"r": b"\r", b"v": b"\v"}
+
+
+def unquote_path(raw: bytes) -> str:
+    """Undo git's C-style quoting of a path in diff headers ("a/we\\"ird" -> a/we"ird)."""
+    if not raw.startswith(b'"'):
+        return raw.decode("utf-8", "replace")
+    body, out, i = raw[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i:i + 1]
+        if ch == b"\\" and i + 1 < len(body):
+            nxt = body[i + 1:i + 2]
+            if re.fullmatch(rb"[0-7]{3}", body[i + 1:i + 4]):
+                out.append(int(body[i + 1:i + 4], 8))
+                i += 4
+                continue
+            out += _ESC.get(nxt, nxt)
+            i += 2
+            continue
+        out += ch
+        i += 1
+    return out.decode("utf-8", "replace")
+
+
 def resolve_git_dir(path: Path) -> Path:
     """The repository's own git directory. Refuses to search parent directories."""
     path = Path(path).resolve()
@@ -109,6 +147,8 @@ class GitSource:
         self.notes: list[str] = []
         self.truncated = False
         self._commits: list[Commit] | None = None
+        self._tip_cache: dict[str, list[tuple[str, str]]] = {}
+        self._tips: list[str] | None = None
         rc, _, err = self._git("rev-parse", "--git-dir")
         if rc != 0:
             raise RuntimeError(f"not a git repository: {err.strip()}")
@@ -162,39 +202,59 @@ class GitSource:
         return commits
 
     def content_hits(self) -> list[ContentHit]:
-        by_sha = {c.sha: c for c in self.commits()}
-        hits = []
-        for ioc in self.iocs.content:
-            args = [*self._log_base(), f"-G{ioc.regex}", "--name-only", "--format=%H"]
-            if ioc.paths:
-                args += ["--", *[f":(glob){p}**" if p.endswith("/") else f":(glob)**/*{p}" for p in ioc.paths]]
-            rc, out, err = self._git(*args)
-            if rc != 0 and out == "" and err.strip():
-                raise RuntimeError(f"git log -G failed for {ioc.id}: {err.strip()[-200:]}")
-            sha, paths = None, []
-            for tok in out.split("\0") + [None]:
-                t = tok.lstrip("\n") if tok is not None else None
-                if t is None or (t in by_sha and SHA_RE.match(t)):
-                    if sha:
-                        hits.append(ContentHit(ioc, by_sha.get(sha), sha, [p for p in paths if ioc.applies_to(p)] or paths))
-                    sha, paths = t, []
-                elif t:
-                    paths.append(t)
-        return hits
+        """Stream every diff in the window once and match changed lines in Python.
 
-    def blob(self, commit_sha: str, path: str) -> bytes | None:
-        spec = f"{commit_sha}:{path}"
+        git's own regex engine (-G) is several times slower on large histories. Added and removed
+        lines both count, so reverted payloads are still found.
+        """
+        by_sha = {c.sha: c for c in self.commits()}
+        found: dict[tuple[str, str], list[str]] = {}
+        any_rx = self.iocs.content_any_b
+        sha, path, in_header = None, "", False
+        args = [*self._log_base(), "-p", "--format=%x00C%H"]
+        args.remove("-z")
+        for line in git_stream(self.git_dir, *args):
+            if line.startswith(b"\x00C"):
+                sha, path, in_header = line[2:].strip().decode(), "", False
+            elif line.startswith(b"diff --git "):
+                path, in_header = "", True
+            elif in_header:
+                if line.startswith(b"@@"):
+                    in_header = False
+                elif line.startswith((b"--- ", b"+++ ")):
+                    name = line[4:].rstrip(b"\n")
+                    if name.endswith(b"\t"):  # git appends a tab when the name contains a space
+                        name = name[:-1]
+                    if name != b"/dev/null":
+                        p = unquote_path(name)
+                        path = p[2:] if p[:2] in ("a/", "b/") else p
+            elif sha and line[:1] in (b"+", b"-") and any_rx.search(line, 1):
+                for ioc in self.iocs.content:
+                    if ioc.rxb.search(line, 1) and ioc.applies_to(path):
+                        paths = found.setdefault((ioc.id, sha), [])
+                        if path not in paths:
+                            paths.append(path)
+        by_id = {i.id: i for i in self.iocs.content}
+        return [ContentHit(by_id[i], by_sha.get(s), s, paths) for (i, s), paths in found.items()]
+
+    def blob(self, commit_sha: str, path: str | None) -> bytes | None:
+        spec = f"{commit_sha}:{path}" if path is not None else commit_sha
         rc, size, _ = self._git("cat-file", "-s", spec)
         if rc != 0:
             return None
         if int(size.strip() or 0) > MAX_BLOB:
-            self.notes.append(f"skipped {path} at {commit_sha[:12]}: larger than {MAX_BLOB // 1048576} MB")
+            self.notes.append(f"skipped {path or 'blob'} at {commit_sha[:12]}: larger than {MAX_BLOB // 1048576} MB")
             self.truncated = True
             return None
         rc, out, _ = self._git("cat-file", "blob", spec, binary=True)
         return out if rc == 0 else None
 
     def tips(self) -> list[str]:
+        if self._tips is None:
+            self._tips = self._compute_tips()
+        return self._tips
+
+    def _compute_tips(self) -> list[str]:
         refs = self._refs("refs/heads", "refs/remotes")
         _, head, _ = self._git("symbolic-ref", "-q", "HEAD")
         head = head.strip()
@@ -204,9 +264,24 @@ class GitSource:
             self.truncated = True
         return refs[: self.max_tips]
 
+    def tip_entries(self, ref: str) -> list[tuple[str, str]]:
+        """(path, blob sha) for every file on a branch tip. Cached: several checks walk the same tips."""
+        if ref not in self._tip_cache:
+            _, out, _ = self._git("ls-tree", "-r", "-z", "--full-tree", ref)
+            entries = []
+            for rec in out.split("\0"):
+                meta, _, path = rec.partition("\t")
+                parts = meta.split(" ")
+                if path and len(parts) == 3 and parts[1] == "blob":
+                    entries.append((path, parts[2]))
+            self._tip_cache[ref] = entries
+        return self._tip_cache[ref]
+
     def tip_files(self, ref: str) -> list[str]:
-        _, out, _ = self._git("ls-tree", "-r", "-z", "--name-only", ref)
-        return [p for p in out.split("\0") if p]
+        return [p for p, _ in self.tip_entries(ref)]
+
+    def read_blob(self, blob_sha: str) -> bytes | None:
+        return self.blob(blob_sha, None)
 
     def read_tip(self, ref: str, path: str) -> bytes | None:
         return self.blob(ref, path)
@@ -343,7 +418,7 @@ class ApiSource:
         return None
 
     def tips(self) -> list[str]:
-        if len(self._branch_objs()) > 1:
+        if len(self._branch_objs()) > 1 and "branch tip checks cover the default branch only in API mode" not in self.notes:
             self.notes.append("branch tip checks cover the default branch only in API mode")
         return [self.default] if self._branch_objs() else []
 
@@ -357,8 +432,14 @@ class ApiSource:
             self._tree = {e["path"]: e["sha"] for e in t.get("tree", []) if e.get("type") == "blob"}
         return self._tree
 
+    def tip_entries(self, ref: str) -> list[tuple[str, str]]:
+        return list(self._tree_map().items())
+
     def tip_files(self, ref: str) -> list[str]:
         return list(self._tree_map())
+
+    def read_blob(self, blob_sha: str) -> bytes | None:
+        return self._blob_by_sha(blob_sha)
 
     def read_tip(self, ref: str, path: str) -> bytes | None:
         sha = self._tree_map().get(path)

@@ -1,6 +1,7 @@
 """Minimal GitHub REST client (standard library only)."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -97,11 +98,12 @@ class GitHub:
                     time.sleep(2 ** attempt)
                     continue
                 return e.code, headers, body
-            except (urllib.error.URLError, TimeoutError) as e:
-                if attempt < 3:
+            except (OSError, http.client.HTTPException) as e:
+                # Dropped connections, resets, timeouts and truncated bodies (IncompleteRead) are transient.
+                if attempt < 4:
                     time.sleep(2 ** attempt)
                     continue
-                raise GitHubError(0, str(e), url) from e
+                raise GitHubError(0, f"network error: {type(e).__name__}: {e}", url) from e
         raise GitHubError(0, "retries exhausted", url)
 
     @staticmethod
