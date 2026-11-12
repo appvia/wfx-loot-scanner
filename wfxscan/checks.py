@@ -70,6 +70,7 @@ class RepoResult:
     mode: str = ""
     status: str = "CLEAN"
     error: str = ""
+    truncated: bool = False  # a coverage limit was reached somewhere
     notes: list[str] = field(default_factory=list)
     checks: list[CheckResult] = field(default_factory=list)
 
@@ -79,7 +80,7 @@ class RepoResult:
 
     def finish(self):
         m = self.max_sev
-        incomplete = self.error or any(c.status == "ERROR" for c in self.checks)
+        incomplete = self.error or self.truncated or any(c.status == "ERROR" for c in self.checks)
         self.status = ("LIKELY COMPROMISED" if m >= 4 else "SUSPICIOUS" if m == 3 else
                        "REVIEW" if m == 2 else "INCOMPLETE" if incomplete else "CLEAN")
 
@@ -96,10 +97,13 @@ def touches_ci(c: Commit, iocs: IOCs) -> bool:
                for f in c.files)
 
 
+PULLS_CAP = 2000
+
+
 def recent_pulls(gh: GitHub, slug: str, since_iso: str) -> list[dict]:
-    """Pull requests (any state) updated since the window start, newest first."""
+    """Pull requests (any state) updated since the window start, newest first, up to PULLS_CAP."""
     return list(gh.paginate(f"repos/{slug}/pulls", {"state": "all", "sort": "updated", "direction": "desc"},
-                            stop=lambda p: p["updated_at"] < since_iso, allow=(404,)))
+                            stop=lambda p: p["updated_at"] < since_iso, allow=(404,), max_pages=PULLS_CAP // 100))
 
 
 # ============================================================================ runner
@@ -113,6 +117,7 @@ class RepoScan:
         self.affected = affected
         self.flagged: dict[str, Commit | None] = {}
         self.run_shas: set[str] | None = None
+        self.truncated = False
         self.result = RepoResult(name, mode=source.mode if source else "api")
 
     def run(self) -> RepoResult:
@@ -126,8 +131,12 @@ class RepoScan:
                 else:
                     getattr(self, "c_" + cid.replace("-", "_").lower())(cr)
             except GitHubError as e:
-                cr.status = "SKIP" if e.status in (403, 404) and needs == "API" else "ERROR"
-                cr.summary = f"GitHub API: {e}"
+                # 404 on an Actions endpoint means Actions is not enabled. Anything else (403 permission,
+                # SSO, exhausted rate limit) means we could not look, which must not read as a pass.
+                if e.status == 404 and needs == "API":
+                    cr.status, cr.summary = "SKIP", f"not available for this repository (GitHub API: {e})"
+                else:
+                    cr.status, cr.summary = "ERROR", f"GitHub API: {e}"
             except Exception as e:  # noqa: BLE001 - report and carry on
                 cr.status, cr.summary = "ERROR", f"{type(e).__name__}: {e}"
             cr.finish()
@@ -137,8 +146,16 @@ class RepoScan:
             self.result.checks.append(cr)
         if self.src is not None:
             self.result.notes.extend(dict.fromkeys(self.src.notes))
+            self.truncated = self.truncated or self.src.truncated
+        self.result.notes = list(dict.fromkeys(self.result.notes))
+        self.result.truncated = self.truncated
         self.result.finish()
         return self.result
+
+    def _limit(self, cr, what: str):
+        cr.summary += f" (limit reached: {what})"
+        self.result.notes.append(f"{cr.id}: limit reached, {what}")
+        self.truncated = True
 
     def _flag(self, cr, sev, detail, c: Commit, ref_extra=""):
         cr.add(sev, detail, c.ctx() + ref_extra, commit=c.sha)
@@ -165,6 +182,8 @@ class RepoScan:
                 cr.add(sev, f"PR #{p['number']} ({p.get('state')}) by @{user}: {', '.join(reasons)}. Treat @{user} as compromised.",
                        f"{p.get('html_url')} opened {p.get('created_at')}")
         cr.summary = f"{len(pulls)} pull requests updated since {self.since_iso[:10]} inspected"
+        if len(pulls) >= PULLS_CAP:
+            self._limit(cr, f"first {PULLS_CAP} pull requests only")
 
     def c_wfx_02(self, cr):
         names = self.src.branches()
@@ -254,6 +273,8 @@ class RepoScan:
                         or (flagged and (WORKFLOW_RE.match(f.path) or f.path.endswith((".sh", "package.json"))))):
                     cands[(c.sha, f.path)] = c
         hashed = 0
+        if len(cands) > 200:
+            self._limit(cr, f"200 of {len(cands)} candidate files hashed")
         for (sha, path), c in list(cands.items())[:200]:
             data = self.src.blob(sha, path)
             if data is None:
@@ -274,7 +295,10 @@ class RepoScan:
         n = 0
         for ref in self.src.tips():
             for path in self.src.tip_files(ref):
-                if path.rsplit("/", 1)[-1] in MANIFEST_NAMES and n < 100:
+                if path.rsplit("/", 1)[-1] in MANIFEST_NAMES:
+                    if n >= 100:
+                        self._limit(cr, "first 100 manifest files only")
+                        break
                     n += 1
                     data = self.src.read_tip(ref, path)
                     for hit in self.iocs.package_hits(path, (data or b"").decode("utf-8", "replace")):
@@ -290,7 +314,10 @@ class RepoScan:
                 m = self.iocs.payload_path_match(path)
                 if m:
                     cr.add(m[0], f"'{path}' present: {m[1]}", ref)
-                if path.endswith("package.json") and "node_modules/" not in path and pj < 50:
+                if path.endswith("package.json") and "node_modules/" not in path:
+                    if pj >= 50:
+                        self._limit(cr, "first 50 package.json files only")
+                        break
                     pj += 1
                     try:
                         scripts = json.loads(self.src.read_tip(ref, path) or b"{}").get("scripts") or {}
@@ -337,8 +364,9 @@ class RepoScan:
                 gaps += len(missing)
                 shown = ", ".join(f"#{m}" for m in missing[:12]) + (" ..." if len(missing) > 12 else "")
                 cr.add("MEDIUM", f"{len(missing)} missing run number(s) in {wf}: {shown}")
-        cr.summary = (f"{len(runs)} run(s) across {len(by_wf)} workflow(s) since {start}, "
-                      f"{gaps} missing run number(s)") + (" (first 1,000 runs only)" if len(runs) >= 1000 else "")
+        cr.summary = f"{len(runs)} run(s) across {len(by_wf)} workflow(s) since {start}, {gaps} missing run number(s)"
+        if len(runs) >= 1000:
+            self._limit(cr, "first 1,000 runs only")
 
     def c_wfx_16(self, cr):
         window = [s for s, c in self.flagged.items() if c is None or c.date >= self.iocs.attack_start]

@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -14,14 +15,33 @@ STATUS_MEANING = {
     "LIKELY COMPROMISED": "At least one critical indicator. Treat the repository's secrets and the accounts involved as compromised.",
     "SUSPICIOUS": "At least one high-severity indicator. Investigate before ruling out compromise.",
     "REVIEW": "Medium-severity indicators only. These are often benign; confirm by hand.",
-    "INCOMPLETE": "No indicators found, but at least one check could not run.",
+    "INCOMPLETE": "No indicators found, but coverage was partial (a check could not run, a limit was reached, or the target could not be read).",
     "CLEAN": "Every check that could run found nothing.",
 }
 RESULT_MEANING = "PASS: nothing found. WARN: medium-severity hits. FAIL: high or critical hits. SKIP: not applicable or no access. ERROR: the check failed to run."
 
 
-def _md_escape(s: str) -> str:
-    return str(s).replace("|", "\\|").replace("\n", " ")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+_MD_SPECIAL = re.compile(r"[\\`*_{}\[\]()#+!|<>&~]")
+
+
+def _md_escape(s) -> str:
+    """Make untrusted text inert in Markdown and HTML: no tags, links, emphasis, headings or table breaks."""
+    s = _CONTROL.sub(" ", str(s))
+    return _MD_SPECIAL.sub(lambda m: f"&#{ord(m.group())};", s)
+
+
+def _code(s) -> str:
+    return f"<code>{_md_escape(s)}</code>"
+
+
+_CSV_FORMULA = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(v) -> str:
+    """Stop spreadsheets treating untrusted text as a formula."""
+    v = "" if v is None else str(v)
+    return "'" + v if v.startswith(_CSV_FORMULA) else v
 
 
 def write_reports(results: list[RepoResult], out_dir: Path, meta: dict) -> dict[str, Path]:
@@ -37,11 +57,12 @@ def write_reports(results: list[RepoResult], out_dir: Path, meta: dict) -> dict[
         w.writerow(["repository", "repository_status", "check_id", "check", "result", "check_summary",
                     "severity", "finding", "reference"])
         for r in results:
-            for c in r.checks:
-                rows = c.hits or [None]
+            for c in r.checks or [None]:
+                rows = (c.hits if c else None) or [None]
                 for h in rows:
-                    w.writerow([r.name, r.status, c.id, c.title, c.status, c.summary,
-                                h.severity if h else "", h.detail if h else "", h.ref if h else ""])
+                    w.writerow([_csv_cell(x) for x in (
+                        r.name, r.status, c.id if c else "", c.title if c else "", c.status if c else "",
+                        (c.summary if c else r.error), h.severity if h else "", h.detail if h else "", h.ref if h else "")])
 
     paths["md"].write_text(_markdown(results, meta))
     return paths
@@ -77,9 +98,10 @@ def _markdown(results: list[RepoResult], meta: dict) -> str:
         body = _repo_section(r)
         if r.status == "CLEAN":
             c = r.counts()
-            L += [f"<details><summary>{r.name}: CLEAN ({c['PASS']} passed, {c['SKIP']} skipped)</summary>", "", *body, "</details>", ""]
+            L += [f"<details><summary>{_md_escape(r.name)}: CLEAN ({c['PASS']} passed, {c['SKIP']} skipped)</summary>", "",
+                  *body, "</details>", ""]
         else:
-            L += [f"### {r.name}: {r.status}", "", *body]
+            L += [f"### {_md_escape(r.name)}: {r.status}", "", *body]
 
     L += ["## Checks performed", "", "| ID | Check | What it looks for | Data used |", "|---|---|---|---|"]
     for cid, title, what, needs in CHECKS:
@@ -101,7 +123,7 @@ def _markdown(results: list[RepoResult], meta: dict) -> str:
           "6. Withdraw any package version built between the malicious commit and the clean-up commit and publish again from a clean commit.",
           ""]
     L += ["## References", ""]
-    L += [f"- {k}: {v}" for k, v in meta["sources"].items()]
+    L += [f"- {_md_escape(k)}: {_md_escape(v)}" for k, v in meta["sources"].items()]
     return "\n".join(L) + "\n"
 
 
@@ -118,8 +140,8 @@ def _repo_section(r: RepoResult) -> list[str]:
     if findings:
         L += ["Findings:", ""]
         for c, h in findings:
-            L.append(f"- **{h.severity}** {c.id}: {h.detail}" + (f"  \n  `{h.ref}`" if h.ref else ""))
+            L.append(f"- **{h.severity}** {c.id}: {_md_escape(h.detail)}" + (f"<br>{_code(h.ref)}" if h.ref else ""))
         L.append("")
     if r.notes:
-        L += ["Coverage notes:", ""] + [f"- {n}" for n in r.notes] + [""]
+        L += ["Coverage notes:", ""] + [f"- {_md_escape(n)}" for n in r.notes] + [""]
     return L

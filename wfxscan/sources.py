@@ -1,12 +1,16 @@
 """Where repository data comes from: a local git repository or the GitHub API.
 
 Both sources expose the same interface so every check runs the same way in either mode.
-Neither source executes repository content.
+Repository data is untrusted: git is run so that repository config and attributes cannot
+start programs (no textconv, external diff, signature verification, hooks or fsmonitor),
+and output is parsed NUL-separated so names and messages cannot break parsing.
 """
 from __future__ import annotations
 
 import datetime as dt
 import os
+import re
+import urllib.parse
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,17 +18,47 @@ from pathlib import Path
 from .github import GitHub, GitHubError
 from .iocs import IOCs, ContentIOC
 
-# Isolate git from user/system config (URL rewrites, fsmonitor, textconv etc.).
-GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-           "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
-GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "-c", "safe.directory=*"]
+TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+# Command-line config overrides any repository config that could start a program or change output.
+GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "-c", "core.quotePath=false",
+            "-c", "log.showSignature=false", "-c", "core.pager=cat"]
+NO_DIFF_PROGRAMS = ["--no-textconv", "--no-ext-diff"]
+MAX_BLOB = 20 * 1024 * 1024
+NUMSTAT_RE = re.compile(r"^\n?(\d+|-)\t(\d+|-)\t(.*)$", re.S)
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def git(repo, *args, timeout=3600, binary=False, env_extra=None):
-    p = subprocess.run(["git", *GIT_SAFE, "-C", str(repo), *args],
-                       env={**GIT_ENV, **(env_extra or {})}, capture_output=True, timeout=timeout)
+def child_env(extra=None) -> dict:
+    """Environment for git: no GitHub tokens, no user or system git config, never prompt."""
+    env = {k: v for k, v in os.environ.items() if k not in TOKEN_VARS and not k.startswith("GIT_")}
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"})
+    env.update(extra or {})
+    return env
+
+
+def git(repo, *args, timeout=3600, binary=False, env_extra=None, git_dir=None):
+    loc = [f"--git-dir={git_dir}"] if git_dir else ["-C", str(repo)]
+    p = subprocess.run(["git", *GIT_SAFE, *loc, *args], env=child_env(env_extra), capture_output=True, timeout=timeout,
+                       cwd=str(git_dir) if git_dir else None)  # keep the caller's directory out of attribute lookup
     out = p.stdout if binary else p.stdout.decode("utf-8", "replace")
     return p.returncode, out, p.stderr.decode("utf-8", "replace")
+
+
+def resolve_git_dir(path: Path) -> Path:
+    """The repository's own git directory. Refuses to search parent directories."""
+    path = Path(path).resolve()
+    dot = path / ".git"
+    if dot.is_dir():
+        return dot
+    if dot.is_file():
+        m = re.match(r"gitdir: (.+)", dot.read_text().strip())
+        if m:
+            return (path / m.group(1)).resolve()
+    if (path / "HEAD").is_file() and (path / "objects").is_dir():
+        return path  # bare repository or mirror
+    raise RuntimeError(f"not a git repository (or not its top level): {path}")
 
 
 @dataclass
@@ -68,21 +102,27 @@ class GitSource:
 
     def __init__(self, path: Path, since: str, iocs: IOCs, max_tips: int = 50):
         self.path = Path(path)
+        self.git_dir = resolve_git_dir(self.path)
         self.since = since
         self.iocs = iocs
         self.max_tips = max_tips
         self.notes: list[str] = []
+        self.truncated = False
         self._commits: list[Commit] | None = None
-        rc, _, err = git(self.path, "rev-parse", "--git-dir")
+        rc, _, err = self._git("rev-parse", "--git-dir")
         if rc != 0:
             raise RuntimeError(f"not a git repository: {err.strip()}")
 
+    def _git(self, *args, binary=False):
+        return git(self.path, *args, binary=binary, git_dir=self.git_dir)
+
     def _refs(self, *prefixes):
-        _, out, _ = git(self.path, "for-each-ref", "--format=%(refname)", *prefixes)
-        return [r for r in out.splitlines() if r and not r.endswith("/HEAD")]
+        _, out, _ = self._git("for-each-ref", "--format=%(refname)", *prefixes)
+        return [r for r in out.split("\n") if r and not r.endswith("/HEAD")]
 
     def _log_base(self):
-        return ["log", "--exclude=refs/pull/*/merge", "--all", f"--since={self.since}"]
+        return ["log", *NO_DIFF_PROGRAMS, "--no-renames", "-z", "--exclude=refs/pull/*/merge", "--all",
+                f"--since={self.since}"]
 
     def branches(self) -> list[str]:
         names = []
@@ -94,23 +134,29 @@ class GitSource:
     def commits(self) -> list[Commit]:
         if self._commits is not None:
             return self._commits
-        rc, out, err = git(self.path, *self._log_base(), "--no-renames", "--numstat",
-                           "--format=%x1e%H%x1f%an <%ae>%x1f%cI%x1f%s")
-        if rc != 0 and "does not have any commits" not in err and out == "":
-            if self._refs("refs/heads", "refs/remotes", "refs/pull"):
-                raise RuntimeError(f"git log failed: {err.strip()[-200:]}")
-        commits = []
-        for chunk in out.split("\x1e")[1:]:
-            lines = chunk.strip("\n").split("\n")
-            try:
-                sha, author, cdate, subject = lines[0].split("\x1f", 3)
-            except ValueError:
+        rc, out, err = self._git(*self._log_base(), "--numstat", "--format=%H%x00%an <%ae>%x00%cI%x00%s")
+        if rc != 0 and out == "" and self._refs("refs/heads", "refs/remotes", "refs/pull"):
+            raise RuntimeError(f"git log failed: {err.strip()[-200:]}")
+        commits, tokens, i = [], out.split("\0"), 0
+        while i + 3 < len(tokens):
+            sha = tokens[i].lstrip("\n")
+            if not SHA_RE.match(sha):
+                i += 1
                 continue
-            c = Commit(sha, author, _parse_date(cdate), subject)
-            for line in lines[1:]:
-                parts = line.split("\t")
-                if len(parts) == 3:
-                    c.files.append(FileChange(parts[2], int(parts[0]) if parts[0].isdigit() else 0))
+            try:
+                c = Commit(sha, tokens[i + 1], _parse_date(tokens[i + 2]), tokens[i + 3])
+            except ValueError:
+                self.notes.append(f"could not parse commit {sha[:12]}")
+                self.truncated = True
+                i += 4
+                continue
+            i += 4
+            while i < len(tokens):
+                m = NUMSTAT_RE.match(tokens[i])
+                if not m:
+                    break
+                c.files.append(FileChange(m.group(3), int(m.group(1)) if m.group(1).isdigit() else 0))
+                i += 1
             commits.append(c)
         self._commits = commits
         return commits
@@ -119,43 +165,54 @@ class GitSource:
         by_sha = {c.sha: c for c in self.commits()}
         hits = []
         for ioc in self.iocs.content:
-            args = [*self._log_base(), "--no-renames", f"-G{ioc.regex}", "--name-only", "--format=%x1e%H"]
+            args = [*self._log_base(), f"-G{ioc.regex}", "--name-only", "--format=%H"]
             if ioc.paths:
                 args += ["--", *[f":(glob){p}**" if p.endswith("/") else f":(glob)**/*{p}" for p in ioc.paths]]
-            rc, out, err = git(self.path, *args)
+            rc, out, err = self._git(*args)
             if rc != 0 and out == "" and err.strip():
                 raise RuntimeError(f"git log -G failed for {ioc.id}: {err.strip()[-200:]}")
-            for chunk in out.split("\x1e")[1:]:
-                lines = [ln for ln in chunk.strip("\n").split("\n") if ln]
-                if not lines:
-                    continue
-                sha = lines[0].strip()
-                paths = [p for p in lines[1:] if ioc.applies_to(p)] or lines[1:]
-                hits.append(ContentHit(ioc, by_sha.get(sha), sha, paths))
+            sha, paths = None, []
+            for tok in out.split("\0") + [None]:
+                t = tok.lstrip("\n") if tok is not None else None
+                if t is None or (t in by_sha and SHA_RE.match(t)):
+                    if sha:
+                        hits.append(ContentHit(ioc, by_sha.get(sha), sha, [p for p in paths if ioc.applies_to(p)] or paths))
+                    sha, paths = t, []
+                elif t:
+                    paths.append(t)
         return hits
 
     def blob(self, commit_sha: str, path: str) -> bytes | None:
-        rc, out, _ = git(self.path, "cat-file", "blob", f"{commit_sha}:{path}", binary=True)
+        spec = f"{commit_sha}:{path}"
+        rc, size, _ = self._git("cat-file", "-s", spec)
+        if rc != 0:
+            return None
+        if int(size.strip() or 0) > MAX_BLOB:
+            self.notes.append(f"skipped {path} at {commit_sha[:12]}: larger than {MAX_BLOB // 1048576} MB")
+            self.truncated = True
+            return None
+        rc, out, _ = self._git("cat-file", "blob", spec, binary=True)
         return out if rc == 0 else None
 
     def tips(self) -> list[str]:
         refs = self._refs("refs/heads", "refs/remotes")
-        _, head, _ = git(self.path, "symbolic-ref", "-q", "HEAD")
+        _, head, _ = self._git("symbolic-ref", "-q", "HEAD")
         head = head.strip()
         refs.sort(key=lambda r: (r != head, r))
         if len(refs) > self.max_tips:
             self.notes.append(f"branch tip checks limited to {self.max_tips} of {len(refs)} branches")
+            self.truncated = True
         return refs[: self.max_tips]
 
     def tip_files(self, ref: str) -> list[str]:
-        _, out, _ = git(self.path, "ls-tree", "-r", "--name-only", ref)
-        return out.splitlines()
+        _, out, _ = self._git("ls-tree", "-r", "-z", "--name-only", ref)
+        return [p for p in out.split("\0") if p]
 
     def read_tip(self, ref: str, path: str) -> bytes | None:
         return self.blob(ref, path)
 
     def commit_exists(self, sha: str) -> bool:
-        return git(self.path, "cat-file", "-e", f"{sha}^{{commit}}")[0] == 0
+        return self._git("cat-file", "-e", f"{sha}^{{commit}}")[0] == 0
 
 
 # ============================================================================ API
@@ -175,13 +232,17 @@ class ApiSource:
         self.max_commits = max_commits
         self.pulls = pulls or []
         self.notes: list[str] = []
+        self.truncated = False
         self._branches: list[dict] | None = None
         self._commits: list[Commit] | None = None
         self._tree: dict[str, str] | None = None
 
     def _branch_objs(self):
         if self._branches is None:
-            self._branches = list(self.gh.paginate(f"repos/{self.slug}/branches", allow=(404, 409)))
+            self._branches = list(self.gh.paginate(f"repos/{self.slug}/branches", allow=(404, 409), max_pages=50))
+            if len(self._branches) >= 5000:
+                self.notes.append("branch listing stopped at 5,000 branches")
+                self.truncated = True
         return self._branches
 
     def branches(self) -> list[str]:
@@ -194,6 +255,7 @@ class ApiSource:
         order = list(dict.fromkeys(order))
         if len(order) > self.max_branches:
             self.notes.append(f"commit history read from {self.max_branches} of {len(order)} branches")
+            self.truncated = True
             order = order[: self.max_branches]
         shas: dict[str, None] = {}
         for name in order:
@@ -211,6 +273,7 @@ class ApiSource:
         out = list(shas)
         if len(out) > self.max_commits:
             self.notes.append(f"commit details limited to {self.max_commits} of {len(out)} commits")
+            self.truncated = True
             out = out[: self.max_commits]
         return out
 
@@ -233,6 +296,7 @@ class ApiSource:
                                           f.get("sha"), f.get("patch")))
             if len(d.get("files") or []) >= 300:
                 self.notes.append(f"{sha[:12]} changes 300+ files; only the first 300 were inspected")
+                self.truncated = True
             commits.append(c)
         self._commits = commits
         return commits
@@ -260,9 +324,15 @@ class ApiSource:
 
     def _blob_by_sha(self, blob_sha: str) -> bytes | None:
         try:
-            return self.gh.get_raw(f"repos/{self.slug}/git/blobs/{blob_sha}")
-        except GitHubError:
-            return None
+            data = self.gh.get_raw(f"repos/{self.slug}/git/blobs/{blob_sha}", max_bytes=MAX_BLOB)
+        except GitHubError as e:
+            if e.status == 404:
+                return None
+            raise  # permission and rate-limit failures must surface as ERROR, not a pass
+        if data is None:
+            self.notes.append(f"skipped blob {blob_sha[:12]}: larger than {MAX_BLOB // 1048576} MB")
+            self.truncated = True
+        return data
 
     def blob(self, commit_sha: str, path: str) -> bytes | None:
         for c in self.commits():
@@ -279,9 +349,11 @@ class ApiSource:
 
     def _tree_map(self) -> dict[str, str]:
         if self._tree is None:
-            t = self.gh.get(f"repos/{self.slug}/git/trees/{self.default}", {"recursive": "1"}, allow=(404, 409, 422)) or {}
+            ref = urllib.parse.quote(self.default, safe="")
+            t = self.gh.get(f"repos/{self.slug}/git/trees/{ref}", {"recursive": "1"}, allow=(404, 409, 422)) or {}
             if t.get("truncated"):
                 self.notes.append("repository tree is too large for one API call; tip checks are partial")
+                self.truncated = True
             self._tree = {e["path"]: e["sha"] for e in t.get("tree", []) if e.get("type") == "blob"}
         return self._tree
 
