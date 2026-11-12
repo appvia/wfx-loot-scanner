@@ -21,6 +21,7 @@ class ContentIOC:
     severity: str
     regex: str
     rx: re.Pattern
+    rxb: re.Pattern  # same pattern for raw bytes (git diff output)
     description: str
     paths: list[str] | None
 
@@ -53,7 +54,8 @@ class IOCs:
                               for x in d["payload_paths"]]
         self.big_workflow_lines = int(d["large_workflow_insertion_lines"])
         self.content = [ContentIOC(c["id"], c["check"], c["severity"], c["regex"], re.compile(c["regex"]),
-                                   c["description"], c.get("paths")) for c in d["content"]]
+                                   re.compile(c["regex"].encode()), c["description"], c.get("paths")) for c in d["content"]]
+        self.content_any_b = re.compile(b"|".join(b"(?:" + c.rxb.pattern + b")" for c in self.content))
         self.sha256 = {h["hash"].lower(): h["description"] for h in d["sha256"]}
         self.commits = {c["sha"].lower(): c["description"] for c in d["commits"]}
         self.packages = d["packages"]

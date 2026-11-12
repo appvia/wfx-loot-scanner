@@ -291,42 +291,55 @@ class RepoScan:
                 cr.add("CRITICAL", f"commit {sha[:12]} present: {desc}", sha, commit=sha)
         cr.summary = f"{len(self.iocs.commits)} published commit SHAs looked up"
 
-    def c_wfx_11(self, cr):
-        n = 0
+    def _tip_blobs(self, want) -> dict[str, tuple[str, list[str]]]:
+        """Unique files on branch tips matching want(path): blob sha -> (path, refs it appears on)."""
+        out: dict[str, tuple[str, list[str]]] = {}
         for ref in self.src.tips():
-            for path in self.src.tip_files(ref):
-                if path.rsplit("/", 1)[-1] in MANIFEST_NAMES:
-                    if n >= 100:
-                        self._limit(cr, "first 100 manifest files only")
-                        break
-                    n += 1
-                    data = self.src.read_tip(ref, path)
-                    for hit in self.iocs.package_hits(path, (data or b"").decode("utf-8", "replace")):
-                        cr.add("HIGH", f"{path} pins affected version {hit}", ref)
-        cr.summary = f"{n} manifest file(s) inspected on branch tips"
+            for path, sha in self.src.tip_entries(ref):
+                if want(path):
+                    out.setdefault(sha, (path, []))[1].append(ref)
+        return out
+
+    @staticmethod
+    def _where(refs: list[str]) -> str:
+        short = [r.split("/", 2)[-1] if r.startswith("refs/heads/") else r for r in refs]
+        return short[0] + (f" and {len(short) - 1} other branch(es)" if len(short) > 1 else "")
+
+    def c_wfx_11(self, cr):
+        cap = 300
+        blobs = self._tip_blobs(lambda p: p.rsplit("/", 1)[-1] in MANIFEST_NAMES)
+        if len(blobs) > cap:
+            self._limit(cr, f"{cap} of {len(blobs)} unique manifest files read")
+        for sha, (path, refs) in list(blobs.items())[:cap]:
+            data = self.src.read_blob(sha)
+            for hit in self.iocs.package_hits(path, (data or b"").decode("utf-8", "replace")):
+                cr.add("HIGH", f"{path} pins affected version {hit}", self._where(refs))
+        cr.summary = f"{min(len(blobs), cap)} unique manifest file(s) read across {len(self.src.tips())} branch tip(s)"
 
     def c_wfx_12(self, cr):
         tips = self.src.tips()
         hook = next(i for i in self.iocs.content if i.id == "postinstall-hook")
-        pj = 0
+        present: dict[str, list[str]] = {}
         for ref in tips:
-            for path in self.src.tip_files(ref):
-                m = self.iocs.payload_path_match(path)
-                if m:
-                    cr.add(m[0], f"'{path}' present: {m[1]}", ref)
-                if path.endswith("package.json") and "node_modules/" not in path:
-                    if pj >= 50:
-                        self._limit(cr, "first 50 package.json files only")
-                        break
-                    pj += 1
-                    try:
-                        scripts = json.loads(self.src.read_tip(ref, path) or b"{}").get("scripts") or {}
-                    except (ValueError, AttributeError):
-                        continue
-                    for k in ("preinstall", "install", "postinstall", "prepare"):
-                        if hook.rx.search(str(scripts.get(k, ""))):
-                            cr.add("CRITICAL", f"{path} '{k}' script runs the payload script", ref)
-        cr.summary = f"{len(tips)} branch tip(s) inspected, {pj} package.json file(s) parsed"
+            for path, _ in self.src.tip_entries(ref):
+                if self.iocs.payload_path_match(path):
+                    present.setdefault(path, []).append(ref)
+        for path, refs in present.items():
+            sev, desc = self.iocs.payload_path_match(path)
+            cr.add(sev, f"'{path}' present: {desc}", self._where(refs))
+        cap = 200
+        blobs = self._tip_blobs(lambda p: p.rsplit("/", 1)[-1] == "package.json" and "node_modules/" not in p)
+        if len(blobs) > cap:
+            self._limit(cr, f"{cap} of {len(blobs)} unique package.json files parsed")
+        for sha, (path, refs) in list(blobs.items())[:cap]:
+            try:
+                scripts = json.loads(self.src.read_blob(sha) or b"{}").get("scripts") or {}
+            except (ValueError, AttributeError):
+                continue
+            for k in ("preinstall", "install", "postinstall", "prepare"):
+                if hook.rx.search(str(scripts.get(k, ""))):
+                    cr.add("CRITICAL", f"{path} '{k}' script runs the payload script", self._where(refs))
+        cr.summary = f"{len(tips)} branch tip(s) inspected, {min(len(blobs), cap)} unique package.json file(s) parsed"
 
     def c_wfx_13(self, cr):
         r = self.gh.get(f"repos/{self.slug}/actions/caches", {"key": self.iocs.cache_prefix, "per_page": 100})
@@ -403,11 +416,9 @@ class RepoScan:
                     data = self.src.blob(c.sha, f.path) or b""
                     if data and not data.startswith(b"wOF2"):
                         self._flag(cr, "CRITICAL", f"'{f.path}' is not a WOFF2 font (GhostAction stealer)", c)
-        for ref in self.src.tips():
-            for path in self.src.tip_files(ref):
-                if path.endswith(fp):
-                    seen += 1
-                    data = self.src.read_tip(ref, path) or b""
-                    if data and not data.startswith(b"wOF2"):
-                        cr.add("CRITICAL", f"'{path}' on branch tip is not a WOFF2 font (GhostAction stealer)", ref)
+        for sha, (path, refs) in self._tip_blobs(lambda p: p.endswith(fp)).items():
+            seen += 1
+            data = self.src.read_blob(sha) or b""
+            if data and not data.startswith(b"wOF2"):
+                cr.add("CRITICAL", f"'{path}' on branch tip is not a WOFF2 font (GhostAction stealer)", self._where(refs))
         cr.summary += f"; {seen} file(s) at {fp} inspected"

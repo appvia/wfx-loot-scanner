@@ -56,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--gh-user", help="use the token of this gh CLI account instead of the active one")
     ap.add_argument("--max-branches", type=int, default=100, help="API mode: branches whose history is read (default 100)")
     ap.add_argument("--max-commits", type=int, default=3000, help="API mode: commits inspected per repository (default 3000)")
+    ap.add_argument("--max-tips", type=int, default=50,
+                    help="clone and path modes: branch tips checked for current files (default 50)")
     ap.add_argument("--no-dataset", action="store_true", help="do not download SafeDep's affected-repositories list")
     ap.add_argument("--offline", action="store_true", help="no network access at all (only valid with --path)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -169,6 +171,15 @@ def main(argv=None):
     workdir = Path(a.workdir).expanduser().resolve()
 
     def work(t):
+        name = t[0]
+        try:
+            return scan_one(t)
+        except Exception as e:  # noqa: BLE001 - one repository must never stop the run
+            res = RepoResult(name, mode=a.mode, error=f"scan failed: {type(e).__name__}: {e}")
+            res.finish()
+            return res
+
+    def scan_one(t):
         name, meta, path = t
         slug = name if "/" in name else None
         src, error, pulls, pulls_error = None, "", None, ""
@@ -180,9 +191,9 @@ def main(argv=None):
                 pulls_error = str(e)
         try:
             if path is not None:
-                src = GitSource(path, since, iocs)
+                src = GitSource(path, since, iocs, max_tips=a.max_tips)
             elif a.mode == "clone":
-                src = GitSource(mirror_sync(workdir, slug, gh.token, a.github_url), since, iocs)
+                src = GitSource(mirror_sync(workdir, slug, gh.token, a.github_url), since, iocs, max_tips=a.max_tips)
             else:
                 src = ApiSource(gh, slug, meta or {}, since, iocs, a.max_branches, a.max_commits, pulls=pulls)
         except Exception as e:  # noqa: BLE001
@@ -201,9 +212,11 @@ def main(argv=None):
     with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
         for i, res in enumerate(ex.map(work, targets), 1):
             c = res.counts()
+            why = res.error or next((f"{x.id}: {x.summary}" for x in res.checks if x.status == "ERROR"), "") \
+                or (res.notes[0] if res.status == "INCOMPLETE" and res.notes else "")
             log(f"[{i}/{len(targets)}] {res.name}: {res.status} "
                 f"(pass {c['PASS']}, warn {c['WARN']}, fail {c['FAIL']}, skip {c['SKIP']}, error {c['ERROR']})"
-                + (f" {res.error[:100]}" if res.error else ""))
+                + (f" - {why[:140]}" if why and res.status != "CLEAN" else ""))
             results.append(res)
     for r in unreachable:
         r.finish()
