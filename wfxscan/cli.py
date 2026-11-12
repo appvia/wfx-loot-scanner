@@ -6,6 +6,7 @@ import base64
 import concurrent.futures as cf
 import csv
 import datetime as dt
+import fnmatch
 import io
 import os
 import re
@@ -49,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "clone: mirror-clone each repository into --workdir and read history with git")
     ap.add_argument("--since", help="start of the history window, YYYY-MM-DD (default: from the IOC set, 2026-10-01)")
     ap.add_argument("--include-archived", action="store_true", help="also scan archived repositories")
+    ap.add_argument("--exclude", action="append", default=[], metavar="OWNER/NAME",
+                    help="do not scan this repository; shell-style wildcards allowed, case-insensitive (repeatable). "
+                         "For repositories that hold indicators on purpose, such as this scanner")
     ap.add_argument("--jobs", type=int, default=4, help="repositories scanned in parallel (default 4)")
     ap.add_argument("--out", default="reports", help="report directory (default ./reports)")
     ap.add_argument("--workdir", default="work", help="mirror clone directory for --mode clone (default ./work)")
@@ -56,8 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--gh-user", help="use the token of this gh CLI account instead of the active one")
     ap.add_argument("--max-branches", type=int, default=100, help="API mode: branches whose history is read (default 100)")
     ap.add_argument("--max-commits", type=int, default=3000, help="API mode: commits inspected per repository (default 3000)")
-    ap.add_argument("--max-tips", type=int, default=50,
-                    help="clone and path modes: branch tips checked for current files (default 50)")
+    ap.add_argument("--max-tips", type=int, default=200,
+                    help="clone and path modes: branch tips checked for current files (default 200)")
     ap.add_argument("--no-dataset", action="store_true", help="do not download SafeDep's affected-repositories list")
     ap.add_argument("--offline", action="store_true", help="no network access at all (only valid with --path)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -162,6 +166,10 @@ def main(argv=None):
         p = Path(p).expanduser().resolve()
         targets.append((origin_slug(p, a.github_url) or p.name, None, p))
 
+    excluded = sorted({t[0] for t in targets if any(fnmatch.fnmatch(t[0].lower(), x.lower()) for x in a.exclude)})
+    targets = [t for t in targets if t[0] not in excluded]
+    if excluded:
+        log(f"excluded {len(excluded)}: {', '.join(excluded)}")
     seen, uniq = set(), []
     for t in targets:
         if t[0].lower() not in seen:
@@ -230,6 +238,7 @@ def main(argv=None):
         "targets": [f"org:{o}" for o in a.org] + [f"repo:{r}" for r in a.repo] + [f"path:{p}" for p in a.path],
         "since": since, "attack_start": iocs.attack_start.strftime("%Y-%m-%d %H:%M UTC"),
         "skipped": skipped, "skipped_reason": "archived" if skipped else "",
+        "excluded": excluded,
         "api_calls": gh.calls if gh else 0, "sources": iocs.sources,
     }
     paths = write_reports(results, Path(a.out).expanduser(), meta)

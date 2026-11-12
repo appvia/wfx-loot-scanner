@@ -133,6 +133,7 @@ Options:
 | `--mode api\|clone` | `api` | Where history is read from (see below) |
 | `--since YYYY-MM-DD` | `2026-10-01` | Start of the history window. The default also covers the October GhostAction wave |
 | `--include-archived` | off | Archived repositories are read-only, so they are skipped by default |
+| `--exclude OWNER/NAME` | | Skip a repository; wildcards allowed (`my-org/*-iocs`), case-insensitive; repeatable. Excluded repositories are listed in the report |
 | `--jobs N` | 4 | Repositories scanned in parallel |
 | `--out DIR` | `./reports` | Report directory |
 | `--workdir DIR` | `./work` | Mirror clones for `--mode clone` |
@@ -140,7 +141,7 @@ Options:
 | `--gh-user LOGIN` | | Use this `gh` account's token |
 | `--max-branches N` | 100 | API mode: branches whose history is read |
 | `--max-commits N` | 3000 | API mode: commits inspected per repository |
-| `--max-tips N` | 50 | Clone and path modes: branch tips checked for current files (WFX-11, WFX-12, WFX-18) |
+| `--max-tips N` | 200 | Clone and path modes: branch tips checked for current files (WFX-11, WFX-12, WFX-18) |
 | `--no-dataset` | off | Do not download SafeDep's affected-repositories list (WFX-17 is skipped) |
 | `--offline` | off | No network access; only valid with `--path` |
 
@@ -164,7 +165,7 @@ The REST API allows 5,000 requests an hour for a user token. The scanner waits a
 ### Large organisations
 
 - Use `--mode clone --jobs 8`. The first run downloads full history for every repository, which can take a while and needs disk space roughly equal to the size of all the repositories. Later runs reuse `--workdir` and only fetch what changed.
-- The progress line gives the reason for anything other than CLEAN, for example `INCOMPLETE ... - branch tip checks limited to 50 of N branches`. Raise the relevant limit (`--max-tips`, `--max-branches`, `--max-commits`) and scan that repository again with `--repo`.
+- The progress line gives the reason for anything other than CLEAN, for example `INCOMPLETE ... - branch tip checks limited to 200 of N branches`. Raise the relevant limit (`--max-tips`, `--max-branches`, `--max-commits`) and scan that repository again with `--repo`.
 - Once mirrors exist, most repositories scan in a second or two. Repositories with thousands of branches or commits in the window take longer, mainly to generate their diffs.
 
 ## Output
@@ -218,6 +219,7 @@ Reports contain repository names, commit details and account names. Treat them a
 - Run-number gaps (WFX-15) also appear when people delete runs. Use them to support other findings, not on their own.
 - The scanner looks at repositories only. It does not read the organisation audit log or cloud logs; do that separately (see above).
 - SafeDep's list covers default branches of public repositories only.
+- Repositories that contain the indicators on purpose are reported as LIKELY COMPROMISED. This includes this scanner's own repository, forks of it, and other threat-intelligence or detection repositories. Skip them with `--exclude`. There is deliberately no marker file a repository can add to exclude itself, because an attacker could add one.
 - Anyone who can open a pull request can trigger findings: a PR with the probe title, or IOC strings pushed in a fork PR, are reported because the scanner reads pull request commits. Check who authored a finding before acting on it.
 
 ## How the scanner protects itself

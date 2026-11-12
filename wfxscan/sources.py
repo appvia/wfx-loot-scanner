@@ -137,6 +137,7 @@ def _parse_date(s: str) -> dt.datetime:
 # ============================================================================ git
 class GitSource:
     mode = "git"
+    read_cap = None  # local reads are cheap: read every unique file on branch tips
 
     def __init__(self, path: Path, since: str, iocs: IOCs, max_tips: int = 50):
         self.path = Path(path)
@@ -283,6 +284,34 @@ class GitSource:
     def read_blob(self, blob_sha: str) -> bytes | None:
         return self.blob(blob_sha, None)
 
+    def read_blobs(self, shas: list[str]) -> dict[str, bytes]:
+        """Read many blobs in one `git cat-file --batch` process. Oversized blobs are skipped."""
+        shas = [x for x in dict.fromkeys(shas) if SHA_RE.match(x)]
+        if not shas:
+            return {}
+        p = subprocess.run(["git", *GIT_SAFE, f"--git-dir={self.git_dir}", "cat-file", "--batch"],
+                           input=("\n".join(shas) + "\n").encode(), env=child_env(), cwd=str(self.git_dir),
+                           capture_output=True, timeout=3600)
+        out, data, i = {}, p.stdout, 0
+        while i < len(data):
+            nl = data.index(b"\n", i)
+            head = data[i:nl].split(b" ")
+            i = nl + 1
+            if len(head) != 3:  # "<sha> missing"
+                continue
+            sha, size = head[0].decode(), int(head[2])
+            if size <= MAX_BLOB:
+                out[sha] = data[i:i + size]
+            else:
+                self.notes.append(f"skipped blob {sha[:12]}: larger than {MAX_BLOB // 1048576} MB")
+                self.truncated = True
+            i += size + 1
+        return out
+
+    def existed_before(self, commit: Commit, f: FileChange) -> bool:
+        """Did this path exist in the commit's first parent (i.e. was an existing file changed)?"""
+        return self._git("cat-file", "-e", f"{commit.sha}^:{f.path}")[0] == 0
+
     def read_tip(self, ref: str, path: str) -> bytes | None:
         return self.blob(ref, path)
 
@@ -293,6 +322,7 @@ class GitSource:
 # ============================================================================ API
 class ApiSource:
     mode = "api"
+    read_cap = 200  # every read is an API call
 
     def __init__(self, gh: GitHub, slug: str, meta: dict, since: str, iocs: IOCs,
                  max_branches: int = 100, max_commits: int = 3000, pulls: list[dict] | None = None):
@@ -440,6 +470,13 @@ class ApiSource:
 
     def read_blob(self, blob_sha: str) -> bytes | None:
         return self._blob_by_sha(blob_sha)
+
+    def read_blobs(self, shas: list[str]) -> dict[str, bytes]:
+        return {sha: data for sha in dict.fromkeys(shas) if (data := self._blob_by_sha(sha)) is not None}
+
+    @staticmethod
+    def existed_before(commit: Commit, f: FileChange) -> bool:
+        return f.status in ("modified", "changed")
 
     def read_tip(self, ref: str, path: str) -> bytes | None:
         sha = self._tree_map().get(path)
